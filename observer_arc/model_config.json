@@ -1,0 +1,45 @@
+{
+  "click_probe_limit": 32,
+  "max_actions": 1037,
+  "name": "observer_arc_v0",
+  "planner_beam_width": 8,
+  "planner_branch_limit": 18,
+  "planner_depth": 48,
+  "planner_max_nodes": 2200,
+  "planner_max_seconds": 0.3,
+  "planner_return_best_nonterminal": true,
+  "repeat_window": 12,
+  "seed": 1729,
+  "simple_action_prior": {
+    "1": 0.58,
+    "2": 0.58,
+    "3": 0.56,
+    "4": 0.56,
+    "5": 0.46,
+    "7": 0.22
+  },
+  "training": {
+    "environment_count": 25,
+    "mean_public_baseline_actions": 93.634,
+    "method": "deterministic metadata-derived priors only",
+    "p75_public_total_baseline_actions": 879,
+    "tag_counts": {
+      "click": 7,
+      "keyboard": 4,
+      "keyboard_click": 13
+    },
+    "uses_external_models": false,
+    "uses_internet_at_inference": false,
+    "uses_public_action_replays": false
+  },
+  "weights": {
+    "base": 0.12,
+    "cliche": 0.22,
+    "coherence": 0.18,
+    "contradiction": 0.45,
+    "grounding": 0.22,
+    "novelty": 0.31,
+    "repetition": 0.29,
+    "value": 0.34
+  }
+}
