@@ -55,6 +55,28 @@ class RoleConsequence:
     reason: str = "role_neutral"
 
 
+@dataclass
+class SubgoalActionCredit:
+    attempts: int = 0
+    useful: int = 0
+    total_score: float = 0.0
+    total_change: float = 0.0
+    total_role: float = 0.0
+    total_level_gain: int = 0
+
+    @property
+    def average(self) -> float:
+        if self.attempts <= 0:
+            return 0.0
+        success_rate = self.useful / max(1, self.attempts)
+        level_bonus = min(1.0, self.total_level_gain / max(1, self.attempts))
+        return (
+            self.total_score / self.attempts
+            + 0.08 * success_rate
+            + 0.20 * level_bonus
+        )
+
+
 class LocalSimulatorPlanner:
     """Beam-search planner over cloned local ARC game states."""
 
@@ -65,6 +87,9 @@ class LocalSimulatorPlanner:
         self.queued_preconditions: list[Any] = []
         self.observed_frame_counts: dict[str, int] = {}
         self.frontier_frame_counts: dict[str, int] = {}
+        self.subgoal_action_credit: dict[tuple[str, str], SubgoalActionCredit] = {}
+        self.subgoal_general_action_credit: dict[str, SubgoalActionCredit] = {}
+        self.subgoal_sequence_attempts: dict[tuple[str, tuple[str, ...]], int] = {}
         self.information_probe_streak = 0
 
     def plan(self, game: Any, latest_frame: Any) -> ActionCandidate | None:
@@ -912,6 +937,16 @@ class LocalSimulatorPlanner:
             max(0.018, min(0.035, seconds_limit * 0.45)),
         )
         if not best_path or best_score < required_score:
+            memory_action = self._subgoal_memory_probe(
+                game,
+                actions,
+                root_signature,
+                root_levels,
+                time.perf_counter(),
+                coverage_seconds,
+            )
+            if memory_action is not None:
+                return memory_action
             return self._coverage_commitment_sequence(
                 game,
                 actions,
@@ -922,6 +957,16 @@ class LocalSimulatorPlanner:
                 pressure,
             )
         if pressure < 0.50 and best_score < best_single_step_score * 1.03:
+            memory_action = self._subgoal_memory_probe(
+                game,
+                actions,
+                root_signature,
+                root_levels,
+                time.perf_counter(),
+                coverage_seconds,
+            )
+            if memory_action is not None:
+                return memory_action
             return self._coverage_commitment_sequence(
                 game,
                 actions,
@@ -943,9 +988,96 @@ class LocalSimulatorPlanner:
             f"role_score={best_role_score:.3f}, reason={best_reason}"
         )
         self._activate_plan(best_path, best_signatures)
+        self._record_committed_trajectory(
+            root_signature,
+            best_path,
+            best_signatures,
+            best_score,
+            best_reason,
+        )
         self._record_frontier_path(best_signatures)
         self._note_selection(first)
         return first
+
+    def _subgoal_memory_probe(
+        self,
+        game: Any,
+        actions: list[ActionCandidate],
+        root_signature: Any,
+        root_levels: int,
+        started: float,
+        seconds_limit: float,
+    ) -> ActionCandidate | None:
+        if not self.subgoal_action_credit:
+            return None
+        best: ActionCandidate | None = None
+        best_score = 0.0
+        best_signature = None
+        best_reason = ""
+        for action in actions[: self.config.branch_limit]:
+            if self._expired(started, seconds_limit):
+                break
+            memory_score = self._subgoal_credit_score(root_signature, action)
+            if memory_score <= 0.030:
+                continue
+            child_game = copy.deepcopy(game)
+            raw = self._perform(child_game, action)
+            if raw is None:
+                continue
+            state = _state_name(getattr(raw, "state", "NOT_FINISHED"))
+            if state == "GAME_OVER":
+                continue
+            child_sig = summarize_frame(getattr(raw, "frame", []))
+            levels = int(getattr(raw, "levels_completed", 0) or 0)
+            level_gain = levels - root_levels
+            changed = frame_distance(root_signature, child_sig)
+            role = _role_consequence_score(root_signature, root_signature, child_sig)
+            child_actions = set(
+                _available_ids(getattr(raw, "available_actions", []) or [])
+            )
+            root_actions = {candidate.action_id for candidate in actions}
+            affordance_shift = 0.0 if child_actions == root_actions else 0.05
+            score = (
+                memory_score
+                + 0.25 * min(1.0, changed)
+                + 0.20 * role.score
+                + affordance_shift
+                + 500.0 * max(0, level_gain)
+                + 1000.0 * (state == "WIN")
+            )
+            if score <= best_score:
+                continue
+            candidate = _copy_candidate(
+                action,
+                source="local-simulator-subgoal-memory",
+            )
+            candidate.novelty_score = min(1.0, changed)
+            candidate.value_score = min(0.45, score)
+            candidate.coherence_score = 0.58
+            candidate.final_score = score
+            candidate.explanation = (
+                f"local simulator subgoal memory selected action; "
+                f"memory_score={memory_score:.3f}, frame_change={changed:.3f}, "
+                f"role_score={role.score:.3f}, projected_gain={level_gain}"
+            )
+            best = candidate
+            best_score = score
+            best_signature = child_sig
+            best_reason = role.reason
+        if best is None or best_score < 0.095:
+            return None
+        self._activate_plan([best], [best_signature] if best_signature is not None else [])
+        if best_signature is not None:
+            self._record_committed_trajectory(
+                root_signature,
+                [best],
+                [best_signature],
+                best_score,
+                best_reason,
+            )
+            self._record_frontier_path([best_signature])
+        self._note_selection(best)
+        return best
 
     def _coverage_commitment_sequence(
         self,
@@ -1007,6 +1139,7 @@ class LocalSimulatorPlanner:
             signatures: list[Any] = []
             previous_sig = root_signature
             cumulative_change = 0.0
+            memory_bonus = 0.0
             best_role = 0.0
             rejected = False
             final_state = "NOT_FINISHED"
@@ -1031,6 +1164,7 @@ class LocalSimulatorPlanner:
                 path.append(candidate)
                 signatures.append(child_sig)
                 cumulative_change += frame_distance(previous_sig, child_sig)
+                memory_bonus += self._subgoal_credit_score(previous_sig, action)
                 best_role = max(
                     best_role,
                     _role_consequence_score(root_signature, previous_sig, child_sig).score,
@@ -1048,15 +1182,22 @@ class LocalSimulatorPlanner:
                 1,
                 len(signatures),
             )
+            sequence_key = (frame_hash, tuple(action.key() for action in path))
+            repeat_penalty = min(
+                0.18,
+                0.045 * self.subgoal_sequence_attempts.get(sequence_key, 0),
+            )
             score = (
                 500.0 * max(0, level_gain)
                 + 1000.0 * (final_state == "WIN")
                 + 0.18 * root_change
                 + 0.10 * min(1.0, cumulative_change)
                 + 0.12 * best_role
+                + 0.16 * min(1.0, memory_bonus)
                 + 0.05 * unique_state_ratio
                 + 0.03 * min(1.0, pressure)
                 - 0.008 * len(path)
+                - repeat_penalty
             )
             if score > best_score:
                 best_path = path
@@ -1083,6 +1224,13 @@ class LocalSimulatorPlanner:
             f"projected_gain={best_level_gain}, final_state={best_state}"
         )
         self._activate_plan(best_path, best_signatures)
+        self._record_committed_trajectory(
+            root_signature,
+            best_path,
+            best_signatures,
+            best_score,
+            "coverage_commitment",
+        )
         self._record_frontier_path(best_signatures)
         self._note_selection(first)
         return first
@@ -1656,6 +1804,110 @@ class LocalSimulatorPlanner:
             ]:
                 self.frontier_frame_counts.pop(key, None)
 
+    def _record_committed_trajectory(
+        self,
+        root_signature: Any,
+        path: list[ActionCandidate],
+        signatures: list[Any],
+        score: float,
+        reason: str,
+    ) -> None:
+        root_hash = getattr(root_signature, "frame_hash", "")
+        if not root_hash or not path or not signatures:
+            return
+        sequence = tuple(action.key() for action in path[: len(signatures)])
+        if sequence:
+            sequence_key = (root_hash, sequence)
+            self.subgoal_sequence_attempts[sequence_key] = (
+                self.subgoal_sequence_attempts.get(sequence_key, 0) + 1
+            )
+        previous = root_signature
+        for index, action in enumerate(path[: len(signatures)]):
+            current = signatures[index]
+            previous_hash = getattr(previous, "frame_hash", "")
+            if not previous_hash:
+                previous = current
+                continue
+            change = frame_distance(previous, current)
+            role = _role_consequence_score(root_signature, previous, current)
+            useful = (
+                change >= 0.006
+                or role.score >= 0.045
+                or action.value_score > 0.10
+                or score > 1.0
+            )
+            local_score = min(
+                1.0,
+                0.12 * max(0.0, min(1.0, score))
+                + 0.50 * min(1.0, change)
+                + 0.34 * role.score
+                + 0.10 * max(0.0, action.value_score)
+            )
+            if reason:
+                local_score += 0.012
+            credit_key = (previous_hash, action.key())
+            credit = self.subgoal_action_credit.setdefault(
+                credit_key,
+                SubgoalActionCredit(),
+            )
+            credit.attempts += 1
+            credit.useful += int(useful)
+            credit.total_score += local_score
+            credit.total_change += change
+            credit.total_role += role.score
+            if action.value_score > 0.90:
+                credit.total_level_gain += int(action.value_score)
+            general_key = _general_action_key(action)
+            general_credit = self.subgoal_general_action_credit.setdefault(
+                general_key,
+                SubgoalActionCredit(),
+            )
+            general_credit.attempts += 1
+            general_credit.useful += int(useful)
+            general_credit.total_score += local_score
+            general_credit.total_change += change
+            general_credit.total_role += role.score
+            if action.value_score > 0.90:
+                general_credit.total_level_gain += int(action.value_score)
+            previous = current
+
+        if len(self.subgoal_action_credit) > 2048:
+            for key in list(self.subgoal_action_credit)[
+                : len(self.subgoal_action_credit) - 2048
+            ]:
+                self.subgoal_action_credit.pop(key, None)
+        if len(self.subgoal_general_action_credit) > 128:
+            for key in list(self.subgoal_general_action_credit)[
+                : len(self.subgoal_general_action_credit) - 128
+            ]:
+                self.subgoal_general_action_credit.pop(key, None)
+        if len(self.subgoal_sequence_attempts) > 2048:
+            for key in list(self.subgoal_sequence_attempts)[
+                : len(self.subgoal_sequence_attempts) - 2048
+            ]:
+                self.subgoal_sequence_attempts.pop(key, None)
+
+    def _subgoal_credit_score(
+        self,
+        signature: Any,
+        action: ActionCandidate,
+    ) -> float:
+        frame_hash = getattr(signature, "frame_hash", "")
+        exact_score = 0.0
+        if not frame_hash:
+            exact_score = 0.0
+        else:
+            credit = self.subgoal_action_credit.get((frame_hash, action.key()))
+            if credit is not None:
+                confidence = min(1.0, credit.attempts / 3.0)
+                exact_score = credit.average * confidence
+        general = self.subgoal_general_action_credit.get(_general_action_key(action))
+        general_score = 0.0
+        if general is not None:
+            general_confidence = min(1.0, general.attempts / 8.0)
+            general_score = 0.45 * general.average * general_confidence
+        return max(0.0, min(1.0, max(exact_score, general_score)))
+
     def _frontier_pressure(
         self,
         root_signature: Any,
@@ -1804,6 +2056,12 @@ def _copy_candidate(candidate: ActionCandidate, source: str) -> ActionCandidate:
         base_score=candidate.base_score,
         final_score=candidate.final_score,
     )
+
+
+def _general_action_key(candidate: ActionCandidate) -> str:
+    if candidate.action_id == 6:
+        return "A6"
+    return f"A{candidate.action_id}"
 
 
 def _rank_and_dedupe(

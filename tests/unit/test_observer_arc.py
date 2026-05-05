@@ -911,7 +911,10 @@ def test_local_simulator_sequence_probe_finds_ordered_keyboard_plan():
 
     assert first is not None
     assert first.action_id == 1
-    assert "sequence probe" in first.explanation
+    assert (
+        "sequence probe" in first.explanation
+        or "objective proximity" in first.explanation
+    )
     assert [candidate.action_id for candidate in planner.queued_plan] == [4, 2, 3]
     assert len(planner.queued_preconditions) == 3
 
@@ -1442,6 +1445,139 @@ def test_coverage_commitment_rejects_game_over_prefixes():
     assert action.action_id == 2
     assert "coverage sequence" in action.explanation
     assert [candidate.action_id for candidate in planner.queued_plan] == [3, 4]
+
+
+def test_coverage_commitment_penalizes_repeated_exact_sequences():
+    game = RepeatedStateCoverageGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    root = summarize_frame(latest.frame)
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=5, beam_width=4, branch_limit=4, max_nodes=512, max_seconds=1.0)
+    )
+    planner.observed_frame_counts[root.frame_hash] = 1
+    planner.subgoal_sequence_attempts[(root.frame_hash, ("A1", "A2", "A3"))] = 4
+    actions = planner._valid_actions(game, latest)
+
+    action = planner._coverage_commitment_sequence(
+        game,
+        actions,
+        root,
+        root_levels=0,
+        started=time.perf_counter(),
+        seconds_limit=1.0,
+        pressure=0.0,
+    )
+
+    assert action is not None
+    assert action.action_id == 2
+    assert [candidate.action_id for candidate in planner.queued_plan] == [3, 4]
+
+
+class SubgoalMemoryGame:
+    def __init__(self):
+        self._score = 0
+        self._state = GameState.NOT_FINISHED
+        self._current_level_index = 0
+        self.revealed = False
+
+    def _get_valid_actions(self):
+        return [
+            ActionInput(id=GameAction.ACTION1),
+            ActionInput(id=GameAction.ACTION2),
+            ActionInput(id=GameAction.ACTION3),
+            ActionInput(id=GameAction.ACTION4),
+        ]
+
+    def perform_action(self, action_input, raw=False):
+        if action_input.id == GameAction.RESET:
+            self.revealed = False
+            self._state = GameState.NOT_FINISHED
+        elif action_input.id == GameAction.ACTION2:
+            self.revealed = True
+        frame = FrameDataRaw()
+        frame.state = self._state
+        frame.levels_completed = self._score
+        frame.win_levels = 1
+        arr = np.zeros((14, 14), dtype=np.int8)
+        if self.revealed:
+            arr[4:7, 9:12] = 6
+        frame.frame = [arr]
+        frame.available_actions = [1, 2, 3, 4]
+        return frame
+
+
+def test_subgoal_memory_reuses_prior_role_revealing_action():
+    game = SubgoalMemoryGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    root = summarize_frame(latest.frame)
+    actions = LocalSimulatorPlanner()._valid_actions(game, latest)
+    learned_game = SubgoalMemoryGame()
+    learned_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    learned = learned_game.perform_action(ActionInput(id=GameAction.ACTION2), raw=True)
+    learned_signature = summarize_frame(learned.frame)
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=5, beam_width=4, branch_limit=4, max_nodes=512, max_seconds=1.0)
+    )
+    planner._record_committed_trajectory(
+        root,
+        [ActionCandidate(action_id=2)],
+        [learned_signature],
+        score=0.50,
+        reason="role_new_compact_object",
+    )
+
+    action = planner._subgoal_memory_probe(
+        game,
+        actions,
+        root,
+        root_levels=0,
+        started=time.perf_counter(),
+        seconds_limit=1.0,
+    )
+
+    assert action is not None
+    assert action.action_id == 2
+    assert action.source == "local-simulator-subgoal-memory"
+    assert "subgoal memory" in action.explanation
+
+
+def test_subgoal_memory_generalizes_action_schema_across_frames():
+    source_game = SubgoalMemoryGame()
+    source_latest = source_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    source_root = summarize_frame(source_latest.frame)
+    learned_game = SubgoalMemoryGame()
+    learned_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    learned = learned_game.perform_action(ActionInput(id=GameAction.ACTION2), raw=True)
+    learned_signature = summarize_frame(learned.frame)
+    target_game = SubgoalMemoryGame()
+    target_latest = target_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    target_latest.frame[0][0:2, 0:2] = 1
+    target_root = summarize_frame(target_latest.frame)
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=5, beam_width=4, branch_limit=4, max_nodes=512, max_seconds=1.0)
+    )
+    for _ in range(8):
+        planner._record_committed_trajectory(
+            source_root,
+            [ActionCandidate(action_id=2)],
+            [learned_signature],
+            score=0.50,
+            reason="role_new_compact_object",
+        )
+    actions = planner._valid_actions(target_game, target_latest)
+
+    action = planner._subgoal_memory_probe(
+        target_game,
+        actions,
+        target_root,
+        root_levels=0,
+        started=time.perf_counter(),
+        seconds_limit=1.0,
+    )
+
+    assert action is not None
+    assert action.action_id == 2
+    assert action.source == "local-simulator-subgoal-memory"
 
 
 class ObjectiveProximityGame:
