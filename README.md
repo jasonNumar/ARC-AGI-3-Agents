@@ -29,6 +29,15 @@ export ARC_API_KEY="your_api_key_here"
 uv run main.py --agent=random --game=ls20
 ```
 
+Observer-centric competition baseline:
+
+```bash
+python main.py --agent=observerarcagent --game=ls20
+OPERATION_MODE=COMPETITION python main.py --agent=observerarcagent
+```
+
+See `OBSERVER_ARC_AGENT.md` for the no-internet policy, open model config, and rule compliance notes.
+
 For more information, see the [documentation](https://three.arcprize.org/docs#quick-start) or the [tutorial video](https://youtu.be/xEVg9dcJMkw).
 
 ## Changelog
