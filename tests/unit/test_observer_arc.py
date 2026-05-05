@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import time
 
 import numpy as np
 from arcengine import ActionInput, FrameDataRaw, GameAction, GameState
@@ -1217,6 +1218,230 @@ def test_local_simulator_frontier_selects_long_horizon_subgoal():
     assert action.action_id == 2
     assert "frontier selected subgoal" in action.explanation
     assert [candidate.action_id for candidate in planner.queued_plan] == [4]
+
+
+def test_frontier_score_prefers_compact_role_consequence_over_visual_flash():
+    root_grid = np.zeros((20, 20), dtype=np.int8)
+    root_grid[9:11, 9:11] = 2
+    flash_grid = root_grid.copy()
+    flash_grid[3:17, 3:17] = 6
+    role_grid = root_grid.copy()
+    role_grid[4:6, 14:16] = 7
+
+    root = summarize_frame([root_grid])
+    flash = summarize_frame([flash_grid])
+    role = summarize_frame([role_grid])
+    planner = LocalSimulatorPlanner()
+    flash_score, flash_reason = planner._frontier_score(
+        root,
+        root,
+        flash,
+        [1, 2, 3],
+        [1, 2, 3],
+        [ActionCandidate(action_id=1)],
+    )
+    role_score, role_reason = planner._frontier_score(
+        root,
+        root,
+        role,
+        [1, 2, 3],
+        [1, 2, 3],
+        [ActionCandidate(action_id=2)],
+    )
+
+    assert role_score > flash_score
+    assert role_reason == "role_new_compact_object"
+    assert flash_reason != "role_new_compact_object"
+
+
+class CommitmentSubgoalGame:
+    def __init__(self):
+        self._score = 0
+        self._state = GameState.NOT_FINISHED
+        self._current_level_index = 0
+        self.phase = 0
+        self.role_visible = False
+        self.x = 8
+
+    def _get_valid_actions(self):
+        return [
+            ActionInput(id=GameAction.ACTION1),
+            ActionInput(id=GameAction.ACTION2),
+            ActionInput(id=GameAction.ACTION3),
+            ActionInput(id=GameAction.ACTION4),
+        ]
+
+    def perform_action(self, action_input, raw=False):
+        if action_input.id == GameAction.RESET:
+            self.phase = 0
+            self.role_visible = False
+            self.x = 8
+            self._state = GameState.NOT_FINISHED
+        elif action_input.id == GameAction.ACTION1:
+            self._state = GameState.GAME_OVER
+        elif action_input.id == GameAction.ACTION2:
+            self.phase = 1
+            self.x = 9
+        elif action_input.id == GameAction.ACTION3 and self.phase == 1:
+            self.role_visible = True
+        frame = FrameDataRaw()
+        frame.state = self._state
+        frame.levels_completed = self._score
+        frame.win_levels = 1
+        arr = np.zeros((20, 20), dtype=np.int8)
+        arr[8:10, self.x : self.x + 2] = 2
+        if self.role_visible:
+            arr[4:6, 14:16] = 7
+        frame.frame = [arr]
+        frame.available_actions = [1, 2, 3, 4]
+        return frame
+
+
+def test_subgoal_commitment_queues_multi_step_role_sequence():
+    game = CommitmentSubgoalGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    root = summarize_frame(latest.frame)
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=5, beam_width=4, branch_limit=4, max_nodes=512, max_seconds=1.0)
+    )
+    actions = planner._valid_actions(game, latest)
+
+    action = planner._subgoal_commitment_probe(
+        game,
+        latest,
+        actions,
+        root,
+        root_levels=0,
+        started=time.perf_counter(),
+        seconds_limit=1.0,
+    )
+
+    assert action is not None
+    assert action.action_id == 2
+    assert action.source == "local-simulator-subgoal-commitment"
+    assert "subgoal commitment" in action.explanation
+    assert [candidate.action_id for candidate in planner.queued_plan] == [3]
+    assert planner.information_probe_streak == 0
+
+
+class RepeatedStateCoverageGame:
+    def __init__(self):
+        self._score = 0
+        self._state = GameState.NOT_FINISHED
+        self._current_level_index = 0
+
+    def _get_valid_actions(self):
+        return [
+            ActionInput(id=GameAction.ACTION1),
+            ActionInput(id=GameAction.ACTION2),
+            ActionInput(id=GameAction.ACTION3),
+            ActionInput(id=GameAction.ACTION4),
+        ]
+
+    def perform_action(self, action_input, raw=False):
+        frame = FrameDataRaw()
+        frame.state = self._state
+        frame.levels_completed = self._score
+        frame.win_levels = 1
+        frame.frame = [np.zeros((10, 10), dtype=np.int8)]
+        frame.available_actions = [1, 2, 3, 4]
+        return frame
+
+
+def test_subgoal_commitment_covers_repeated_state_when_no_signal_scores():
+    game = RepeatedStateCoverageGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    root = summarize_frame(latest.frame)
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=5, beam_width=4, branch_limit=4, max_nodes=512, max_seconds=1.0)
+    )
+    planner.observed_frame_counts[root.frame_hash] = 1
+    actions = planner._valid_actions(game, latest)
+
+    action = planner._subgoal_commitment_probe(
+        game,
+        latest,
+        actions,
+        root,
+        root_levels=0,
+        started=time.perf_counter(),
+        seconds_limit=1.0,
+    )
+
+    assert action is not None
+    assert action.action_id == 1
+    assert action.source == "local-simulator-subgoal-commitment"
+    assert "coverage sequence" in action.explanation
+    assert [candidate.action_id for candidate in planner.queued_plan] == [2, 3]
+
+
+class CoverageAvoidsGameOverGame:
+    def __init__(self):
+        self._score = 0
+        self._state = GameState.NOT_FINISHED
+        self._current_level_index = 0
+        self.seen: set[int] = set()
+
+    def _get_valid_actions(self):
+        return [
+            ActionInput(id=GameAction.ACTION1),
+            ActionInput(id=GameAction.ACTION2),
+            ActionInput(id=GameAction.ACTION3),
+            ActionInput(id=GameAction.ACTION4),
+        ]
+
+    def perform_action(self, action_input, raw=False):
+        if action_input.id == GameAction.RESET:
+            self._state = GameState.NOT_FINISHED
+            self.seen.clear()
+        elif action_input.id == GameAction.ACTION1:
+            self._state = GameState.GAME_OVER
+        elif action_input.id in {
+            GameAction.ACTION2,
+            GameAction.ACTION3,
+            GameAction.ACTION4,
+        }:
+            self.seen.add(int(action_input.id.value))
+        frame = FrameDataRaw()
+        frame.state = self._state
+        frame.levels_completed = self._score
+        frame.win_levels = 1
+        arr = np.zeros((12, 12), dtype=np.int8)
+        if 2 in self.seen:
+            arr[2:4, 2:4] = 2
+        if 3 in self.seen:
+            arr[5:7, 5:7] = 3
+        if 4 in self.seen:
+            arr[8:10, 8:10] = 4
+        frame.frame = [arr]
+        frame.available_actions = [1, 2, 3, 4]
+        return frame
+
+
+def test_coverage_commitment_rejects_game_over_prefixes():
+    game = CoverageAvoidsGameOverGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    root = summarize_frame(latest.frame)
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=5, beam_width=4, branch_limit=4, max_nodes=512, max_seconds=1.0)
+    )
+    planner.observed_frame_counts[root.frame_hash] = 1
+    actions = planner._valid_actions(game, latest)
+
+    action = planner._coverage_commitment_sequence(
+        game,
+        actions,
+        root,
+        root_levels=0,
+        started=time.perf_counter(),
+        seconds_limit=1.0,
+        pressure=0.0,
+    )
+
+    assert action is not None
+    assert action.action_id == 2
+    assert "coverage sequence" in action.explanation
+    assert [candidate.action_id for candidate in planner.queued_plan] == [3, 4]
 
 
 class ObjectiveProximityGame:

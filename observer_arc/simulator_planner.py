@@ -49,6 +49,12 @@ class ObjectiveProbe:
     signature: Any | None = None
 
 
+@dataclass(frozen=True)
+class RoleConsequence:
+    score: float = 0.0
+    reason: str = "role_neutral"
+
+
 class LocalSimulatorPlanner:
     """Beam-search planner over cloned local ARC game states."""
 
@@ -140,6 +146,7 @@ class LocalSimulatorPlanner:
         if information_sequence is not None:
             return information_sequence
         tried_frontier = False
+        tried_commitment = False
         if frontier_pressure > 0.0:
             frontier_action = self._frontier_probe(
                 game,
@@ -161,6 +168,26 @@ class LocalSimulatorPlanner:
                     f"frontier_pressure={frontier_pressure:.2f}"
                 )
                 return frontier_action
+            commitment_action = self._subgoal_commitment_probe(
+                game,
+                latest_frame,
+                root_actions,
+                root_signature,
+                root_levels,
+                time.perf_counter(),
+                min(
+                    self.config.max_seconds,
+                    max(0.070, self.config.max_seconds * 0.50),
+                ),
+                pressure=frontier_pressure,
+            )
+            tried_commitment = True
+            if commitment_action is not None:
+                commitment_action.explanation = (
+                    f"{commitment_action.explanation}; "
+                    f"frontier_pressure={frontier_pressure:.2f}"
+                )
+                return commitment_action
         informative = None
         informative = self._information_probe(
             game,
@@ -187,6 +214,22 @@ class LocalSimulatorPlanner:
             )
             if frontier_action is not None:
                 return frontier_action
+        if not tried_commitment:
+            commitment_action = self._subgoal_commitment_probe(
+                game,
+                latest_frame,
+                root_actions,
+                root_signature,
+                root_levels,
+                time.perf_counter(),
+                min(
+                    self.config.max_seconds,
+                    max(0.055, self.config.max_seconds * 0.40),
+                ),
+                pressure=frontier_pressure,
+            )
+            if commitment_action is not None:
+                return commitment_action
         if self._expired(started, seconds_limit):
             return None
 
@@ -684,6 +727,366 @@ class LocalSimulatorPlanner:
         self._activate_plan(best_path, best_signatures)
         return first
 
+    def _subgoal_commitment_probe(
+        self,
+        game: Any,
+        latest_frame: Any,
+        actions: list[ActionCandidate],
+        root_signature: Any,
+        root_levels: int,
+        started: float,
+        seconds_limit: float,
+        pressure: float = 0.0,
+    ) -> ActionCandidate | None:
+        if len(actions) < 3:
+            return None
+
+        depth_limit = min(self.config.max_depth, 5)
+        node_limit = min(self.config.max_nodes, max(160, self.config.branch_limit * 48))
+        root_action_ids = _available_ids(getattr(latest_frame, "available_actions", []) or [])
+        if not root_action_ids:
+            root_action_ids = sorted({action.action_id for action in actions})
+        frontier: list[PlanNode] = [
+            PlanNode(copy.deepcopy(game), latest_frame, [], [], 0.0, 0)
+        ]
+        seen: set[tuple[str, int, tuple[str, ...]]] = {
+            (root_signature.frame_hash, 0, ())
+        }
+        best_path: list[ActionCandidate] = []
+        best_signatures: list[Any] = []
+        best_score = 0.0
+        best_single_step_score = 0.0
+        best_depth = 0
+        best_reason = ""
+        best_root_change = 0.0
+        best_role_score = 0.0
+        nodes = 0
+
+        for depth in range(depth_limit):
+            next_frontier: list[PlanNode] = []
+            for node in frontier:
+                if self._expired(started, seconds_limit):
+                    break
+                previous_sig = node.signatures[-1] if node.signatures else root_signature
+                node_actions = self._valid_actions(
+                    node.game,
+                    node.frame,
+                    limit=max(self.config.branch_limit, self.config.beam_width * 2),
+                )
+                for action in node_actions[: self.config.branch_limit]:
+                    if self._expired(started, seconds_limit):
+                        break
+                    nodes += 1
+                    if nodes > node_limit:
+                        break
+                    child_game = copy.deepcopy(node.game)
+                    raw = self._perform(child_game, action)
+                    if raw is None:
+                        continue
+                    state = _state_name(getattr(raw, "state", "NOT_FINISHED"))
+                    if state == "GAME_OVER":
+                        continue
+                    child_sig = summarize_frame(getattr(raw, "frame", []))
+                    levels = int(getattr(raw, "levels_completed", 0) or 0)
+                    level_gain = levels - root_levels
+                    candidate = _copy_candidate(
+                        action,
+                        source="local-simulator-subgoal-commitment",
+                    )
+                    path = node.path + [candidate]
+                    signatures = node.signatures + [child_sig]
+                    if level_gain > 0 or state == "WIN":
+                        first = path[0]
+                        first.value_score = float(level_gain)
+                        first.novelty_score = min(
+                            1.0,
+                            _signature_change(root_signature, child_sig),
+                        )
+                        first.coherence_score = 1.0 / (1.0 + depth)
+                        first.final_score = 500.0 * level_gain + 1000.0 * (state == "WIN")
+                        first.explanation = (
+                            f"local simulator subgoal commitment found "
+                            f"{'win' if state == 'WIN' else 'level gain'}; "
+                            f"path_len={len(path)}, projected_gain={level_gain}"
+                        )
+                        self._activate_plan(path, signatures)
+                        self._record_frontier_path(signatures)
+                        self._note_selection(first)
+                        return first
+
+                    child_actions = _available_ids(getattr(raw, "available_actions", []) or [])
+                    objective_probe = self._objective_probe(
+                        child_game,
+                        raw,
+                        child_sig,
+                        root_levels,
+                        root_action_ids,
+                        limit=max(3, min(6, self.config.beam_width)),
+                    )
+                    score, reason = self._frontier_score(
+                        root_signature,
+                        previous_sig,
+                        child_sig,
+                        root_action_ids,
+                        child_actions,
+                        path,
+                        objective_probe,
+                    )
+                    role = _role_consequence_score(
+                        root_signature,
+                        previous_sig,
+                        child_sig,
+                        objective_probe,
+                    )
+                    root_change = _signature_change(root_signature, child_sig)
+                    step_change = _signature_change(previous_sig, child_sig)
+                    cumulative = node.score + max(0.0, score) * (0.84 ** depth)
+                    commitment_score = (
+                        cumulative
+                        + 0.22 * root_change
+                        + 0.20 * role.score
+                        + 0.12 * max(0.0, objective_probe.score)
+                        + 0.04 * min(1.0, step_change)
+                        - 0.030 * len(path)
+                    )
+                    if len(path) == 1:
+                        best_single_step_score = max(
+                            best_single_step_score,
+                            commitment_score,
+                        )
+                    has_subgoal_evidence = (
+                        root_change >= 0.012
+                        or role.score >= 0.070
+                        or objective_probe.score >= 0.220
+                        or set(child_actions) != set(root_action_ids)
+                    )
+                    if (
+                        len(path) >= 2
+                        and has_subgoal_evidence
+                        and (
+                            not best_path
+                            or commitment_score
+                            > best_score + 0.035 * max(0, len(path) - len(best_path))
+                        )
+                    ):
+                        best_path = path
+                        best_signatures = signatures
+                        best_score = commitment_score
+                        best_depth = depth + 1
+                        best_reason = reason
+                        best_root_change = root_change
+                        best_role_score = role.score
+
+                    child_key = _sequence_key(child_sig.frame_hash, path)
+                    if child_key in seen:
+                        continue
+                    seen.add(child_key)
+                    if len(path) >= 2 and (
+                        role.score >= 0.18 or objective_probe.score >= 0.25
+                    ):
+                        continue
+                    if cumulative > -0.04 or has_subgoal_evidence:
+                        next_frontier.append(
+                            PlanNode(
+                                child_game,
+                                raw,
+                                path,
+                                signatures,
+                                cumulative,
+                                depth + 1,
+                            )
+                        )
+            if nodes > node_limit or self._expired(started, seconds_limit):
+                break
+            next_frontier.sort(key=lambda item: item.score, reverse=True)
+            frontier = self._diverse_plan_nodes(
+                next_frontier,
+                max(1, self.config.beam_width * 4),
+            )
+            if not frontier:
+                break
+
+        required_score = max(0.090, 0.150 - 0.050 * min(1.0, pressure))
+        coverage_seconds = min(
+            self.config.max_seconds,
+            max(0.018, min(0.035, seconds_limit * 0.45)),
+        )
+        if not best_path or best_score < required_score:
+            return self._coverage_commitment_sequence(
+                game,
+                actions,
+                root_signature,
+                root_levels,
+                time.perf_counter(),
+                coverage_seconds,
+                pressure,
+            )
+        if pressure < 0.50 and best_score < best_single_step_score * 1.03:
+            return self._coverage_commitment_sequence(
+                game,
+                actions,
+                root_signature,
+                root_levels,
+                time.perf_counter(),
+                coverage_seconds,
+                pressure,
+            )
+        first = best_path[0]
+        first.novelty_score = min(1.0, best_root_change)
+        first.value_score = min(0.45, best_score)
+        first.coherence_score = 0.56
+        first.final_score = best_score
+        first.explanation = (
+            f"local simulator subgoal commitment selected sequence; "
+            f"path_len={len(best_path)}, depth={best_depth}, "
+            f"commitment_score={best_score:.3f}, root_change={best_root_change:.3f}, "
+            f"role_score={best_role_score:.3f}, reason={best_reason}"
+        )
+        self._activate_plan(best_path, best_signatures)
+        self._record_frontier_path(best_signatures)
+        self._note_selection(first)
+        return first
+
+    def _coverage_commitment_sequence(
+        self,
+        game: Any,
+        actions: list[ActionCandidate],
+        root_signature: Any,
+        root_levels: int,
+        started: float,
+        seconds_limit: float,
+        pressure: float,
+    ) -> ActionCandidate | None:
+        frame_hash = getattr(root_signature, "frame_hash", "")
+        visits = self.observed_frame_counts.get(frame_hash, 0)
+        if visits <= 0 and pressure <= 0.0 and self.information_probe_streak < 2:
+            return None
+        simple_actions = [
+            action
+            for action in actions
+            if action.action_id != 6 and action.x is None and action.y is None
+        ]
+        if len(simple_actions) < 3:
+            return None
+        unique: dict[int, ActionCandidate] = {}
+        for action in simple_actions:
+            unique.setdefault(action.action_id, action)
+        ordered = [unique[action_id] for action_id in sorted(unique)]
+        if len(ordered) < 3:
+            return None
+        offset = max(0, visits - 1) % len(ordered)
+        ordered = ordered[offset:] + ordered[:offset]
+
+        width = min(3, len(ordered))
+        sequences: list[list[ActionCandidate]] = []
+        seen_sequences: set[tuple[str, ...]] = set()
+        for base in (ordered, list(reversed(ordered))):
+            for index in range(len(base)):
+                sequence = [base[(index + step) % len(base)] for step in range(width)]
+                key = tuple(action.key() for action in sequence)
+                if key in seen_sequences:
+                    continue
+                seen_sequences.add(key)
+                sequences.append(sequence)
+                if len(sequences) >= min(12, max(4, len(ordered) * 2)):
+                    break
+            if len(sequences) >= min(12, max(4, len(ordered) * 2)):
+                break
+
+        best_path: list[ActionCandidate] = []
+        best_signatures: list[Any] = []
+        best_score = float("-inf")
+        best_root_change = 0.0
+        best_level_gain = 0
+        best_state = "NOT_FINISHED"
+        for sequence in sequences:
+            if self._expired(started, seconds_limit):
+                break
+            child_game = copy.deepcopy(game)
+            path: list[ActionCandidate] = []
+            signatures: list[Any] = []
+            previous_sig = root_signature
+            cumulative_change = 0.0
+            best_role = 0.0
+            rejected = False
+            final_state = "NOT_FINISHED"
+            level_gain = 0
+            for action in sequence:
+                if self._expired(started, seconds_limit):
+                    rejected = True
+                    break
+                candidate = _copy_candidate(
+                    action,
+                    source="local-simulator-subgoal-commitment",
+                )
+                raw = self._perform(child_game, candidate)
+                if raw is None:
+                    rejected = True
+                    break
+                final_state = _state_name(getattr(raw, "state", "NOT_FINISHED"))
+                if final_state == "GAME_OVER":
+                    rejected = True
+                    break
+                child_sig = summarize_frame(getattr(raw, "frame", []))
+                path.append(candidate)
+                signatures.append(child_sig)
+                cumulative_change += frame_distance(previous_sig, child_sig)
+                best_role = max(
+                    best_role,
+                    _role_consequence_score(root_signature, previous_sig, child_sig).score,
+                )
+                previous_sig = child_sig
+                levels = int(getattr(raw, "levels_completed", 0) or 0)
+                level_gain = levels - root_levels
+                if level_gain > 0 or final_state == "WIN":
+                    break
+            if rejected or len(path) < 2:
+                continue
+            final_sig = signatures[-1]
+            root_change = _signature_change(root_signature, final_sig)
+            unique_state_ratio = len({sig.frame_hash for sig in signatures}) / max(
+                1,
+                len(signatures),
+            )
+            score = (
+                500.0 * max(0, level_gain)
+                + 1000.0 * (final_state == "WIN")
+                + 0.18 * root_change
+                + 0.10 * min(1.0, cumulative_change)
+                + 0.12 * best_role
+                + 0.05 * unique_state_ratio
+                + 0.03 * min(1.0, pressure)
+                - 0.008 * len(path)
+            )
+            if score > best_score:
+                best_path = path
+                best_signatures = signatures
+                best_score = score
+                best_root_change = root_change
+                best_level_gain = level_gain
+                best_state = final_state
+
+        if len(best_path) < 2:
+            return None
+        first = best_path[0]
+        first.novelty_score = min(1.0, best_root_change)
+        first.value_score = min(
+            0.35,
+            max(0.0, float(best_level_gain)) + 0.09 + 0.03 * min(1.0, pressure),
+        )
+        first.coherence_score = 0.45
+        first.final_score = best_score
+        first.explanation = (
+            f"local simulator subgoal commitment selected coverage sequence; "
+            f"path_len={len(best_path)}, repeated_state_visits={visits}, "
+            f"root_change={best_root_change:.3f}, pressure={pressure:.2f}, "
+            f"projected_gain={best_level_gain}, final_state={best_state}"
+        )
+        self._activate_plan(best_path, best_signatures)
+        self._record_frontier_path(best_signatures)
+        self._note_selection(first)
+        return first
+
     def _frontier_probe(
         self,
         game: Any,
@@ -909,6 +1312,12 @@ class LocalSimulatorPlanner:
             + self.observed_frame_counts.get(current_signature.frame_hash, 0)
             + self.frontier_frame_counts.get(current_signature.frame_hash, 0)
         )
+        role = _role_consequence_score(
+            root_signature,
+            previous_signature,
+            current_signature,
+            objective_probe,
+        )
         depth_cost = 0.025 * len(path)
         repeat_action_cost = 0.025 * max(
             0,
@@ -916,15 +1325,16 @@ class LocalSimulatorPlanner:
         )
         option_loss_cost = 0.10 * (lost_actions / max(1, len(root_actions)))
         score = (
-            0.34 * root_change
-            + 0.22 * step_change
+            0.21 * root_change
+            + 0.11 * step_change
             + 0.28 * min(1.0, component_delta)
             + 0.26 * min(1.0, affordance_expansion)
             + 0.16 * min(1.0, affordance_change)
             + 0.10 * min(1.0, salience_delta)
             + 0.08 * option_preservation
             + 0.12 * novelty
-            + 0.28 * max(0.0, objective_probe.score)
+            + 0.42 * role.score
+            + 0.30 * max(0.0, objective_probe.score)
             - depth_cost
             - repeat_action_cost
             - option_loss_cost
@@ -937,13 +1347,25 @@ class LocalSimulatorPlanner:
             ("affordance_change", min(1.0, affordance_change)),
             ("salience_delta", min(1.0, salience_delta)),
             ("novelty", novelty),
+            (role.reason, role.score),
             (
                 f"objective_{objective_probe.reason or 'future_branching'}",
                 max(0.0, objective_probe.score),
             ),
         ]
         reason = max(reasons, key=lambda item: item[1])[0]
-        if len(getattr(current_signature, "components", []) or []) > root_components:
+        if role.score >= 0.20 and reason in {
+            "root_change",
+            "step_change",
+            "component_delta",
+            "salience_delta",
+            "novelty",
+        }:
+            reason = role.reason
+        if (
+            len(getattr(current_signature, "components", []) or []) > root_components
+            and role.score < 0.20
+        ):
             reason = "new_visible_components"
         return max(-1.0, min(1.0, score)), reason
 
@@ -967,6 +1389,7 @@ class LocalSimulatorPlanner:
         changes: list[float] = []
         component_deltas: list[float] = []
         affordance_expansions: list[float] = []
+        role_consequences: list[RoleConsequence] = []
         nonterminal_count = 0
         game_over_count = 0
 
@@ -1003,6 +1426,9 @@ class LocalSimulatorPlanner:
                 )
                 / current_components
             )
+            role_consequences.append(
+                _role_consequence_score(current_signature, current_signature, child_sig)
+            )
             child_actions = set(
                 _available_ids(getattr(raw, "available_actions", []) or [])
             )
@@ -1016,6 +1442,7 @@ class LocalSimulatorPlanner:
         avg_change = sum(changes) / max(1, len(changes))
         max_component_delta = max(component_deltas, default=0.0)
         max_affordance_expansion = max(affordance_expansions, default=0.0)
+        best_role = max(role_consequences, key=lambda item: item.score, default=RoleConsequence())
         nonterminal_rate = nonterminal_count / attempted
         game_over_rate = game_over_count / attempted
         score = (
@@ -1024,6 +1451,7 @@ class LocalSimulatorPlanner:
             + 0.16 * avg_change
             + 0.18 * min(1.0, max_component_delta)
             + 0.16 * min(1.0, max_affordance_expansion)
+            + 0.18 * best_role.score
             + 0.10 * nonterminal_rate
             - 0.12 * game_over_rate
         )
@@ -1032,6 +1460,7 @@ class LocalSimulatorPlanner:
             ("future_state_change", max_change),
             ("future_component_delta", min(1.0, max_component_delta)),
             ("future_affordance_expansion", min(1.0, max_affordance_expansion)),
+            (f"future_{best_role.reason}", best_role.score),
             ("future_option_preservation", nonterminal_rate),
         ]
         reason = max(reasons, key=lambda item: item[1])[0]
@@ -1250,8 +1679,10 @@ class LocalSimulatorPlanner:
         elif (
             "frontier" in source
             or "objective" in source
+            or "subgoal" in source
             or "frontier" in candidate.explanation
             or "objective proximity" in candidate.explanation
+            or "subgoal commitment" in candidate.explanation
         ):
             self.information_probe_streak = 0
         elif source != "local-simulator-plan":
@@ -1516,6 +1947,144 @@ def _signature_change(left: Any, right: Any) -> float:
     if getattr(left, "frame_hash", "") != getattr(right, "frame_hash", ""):
         change = max(change, 0.012)
     return min(1.0, change)
+
+
+def _role_consequence_score(
+    root_signature: Any,
+    previous_signature: Any,
+    current_signature: Any,
+    objective_probe: ObjectiveProbe | None = None,
+) -> RoleConsequence:
+    """Estimate whether a transition creates useful object/goal-role evidence.
+
+    This deliberately uses only rendered-frame summaries. It rewards state
+    changes that look like new actionable objects, object motion, boundary
+    contact changes, or near-future affordances rather than raw pixel novelty.
+    """
+    objective_probe = objective_probe or ObjectiveProbe()
+    root_compact = _compact_components(root_signature)
+    previous_compact = _compact_components(previous_signature)
+    current_compact = _compact_components(current_signature)
+
+    compact_emergence = max(0, len(current_compact) - len(root_compact)) / max(
+        1,
+        len(root_compact) + 1,
+    )
+    new_color = len(_object_colors(current_signature) - _object_colors(root_signature)) / max(
+        1,
+        len(_object_colors(current_signature)),
+    )
+    compact_motion = _compact_motion(previous_compact, current_compact, current_signature)
+    boundary_delta = _boundary_interaction_delta(root_signature, current_signature)
+    area_rebalance = _compact_area_rebalance(root_compact, current_compact)
+    future_object_value = max(0.0, objective_probe.score)
+
+    score = (
+        0.34 * min(1.0, compact_emergence)
+        + 0.18 * min(1.0, new_color)
+        + 0.18 * min(1.0, compact_motion)
+        + 0.16 * min(1.0, boundary_delta)
+        + 0.12 * min(1.0, area_rebalance)
+        + 0.18 * future_object_value
+    )
+    signals = [
+        ("role_new_compact_object", compact_emergence),
+        ("role_new_object_color", new_color),
+        ("role_compact_motion", compact_motion),
+        ("role_boundary_interaction", boundary_delta),
+        ("role_object_area_shift", area_rebalance),
+        (f"role_future_{objective_probe.reason or 'branching'}", future_object_value),
+    ]
+    reason = max(signals, key=lambda item: item[1])[0]
+    return RoleConsequence(score=max(0.0, min(1.0, score)), reason=reason)
+
+
+def _compact_components(signature: Any) -> list[Any]:
+    components = list(getattr(signature, "components", []) or [])
+    frame_area = max(
+        1,
+        int(getattr(signature, "width", 0) or 0)
+        * int(getattr(signature, "height", 0) or 0),
+    )
+    out: list[Any] = []
+    for component in components:
+        area = int(getattr(component, "area", 0) or 0)
+        if area <= 0:
+            continue
+        bbox_area = max(
+            1,
+            int(getattr(component, "width", 1) or 1)
+            * int(getattr(component, "height", 1) or 1),
+        )
+        fill = area / bbox_area
+        area_ratio = area / frame_area
+        if fill < 0.45:
+            continue
+        if area_ratio > 0.18:
+            continue
+        if bool(getattr(component, "edge_touch", False)) and area_ratio > 0.05:
+            continue
+        out.append(component)
+    return out
+
+
+def _object_colors(signature: Any) -> set[int]:
+    return {int(getattr(component, "color", -1)) for component in _compact_components(signature)}
+
+
+def _compact_motion(
+    previous_components: list[Any],
+    current_components: list[Any],
+    signature: Any,
+) -> float:
+    if not previous_components or not current_components:
+        return 0.0
+    scale = max(1.0, float(max(getattr(signature, "width", 0), getattr(signature, "height", 0))))
+    best = 0.0
+    for current in current_components:
+        current_color = getattr(current, "color", None)
+        current_area = max(1.0, float(getattr(current, "area", 1) or 1))
+        current_centroid = getattr(current, "centroid", (0.0, 0.0))
+        for previous in previous_components:
+            if getattr(previous, "color", None) != current_color:
+                continue
+            previous_area = max(1.0, float(getattr(previous, "area", 1) or 1))
+            ratio = min(previous_area, current_area) / max(previous_area, current_area)
+            if ratio < 0.45:
+                continue
+            previous_centroid = getattr(previous, "centroid", (0.0, 0.0))
+            distance = (
+                abs(float(current_centroid[0]) - float(previous_centroid[0]))
+                + abs(float(current_centroid[1]) - float(previous_centroid[1]))
+            )
+            best = max(best, min(1.0, distance / scale))
+    return best
+
+
+def _boundary_interaction_delta(root_signature: Any, current_signature: Any) -> float:
+    root_count = _boundary_component_count(root_signature)
+    current_count = _boundary_component_count(current_signature)
+    return abs(current_count - root_count) / max(1, root_count + current_count)
+
+
+def _boundary_component_count(signature: Any) -> int:
+    count = 0
+    for component in _compact_components(signature):
+        bbox = getattr(component, "bbox", (0, 0, 0, 0))
+        width = int(getattr(signature, "width", 0) or 0)
+        height = int(getattr(signature, "height", 0) or 0)
+        near_edge = bbox[0] <= 1 or bbox[1] <= 1 or bbox[2] >= width - 2 or bbox[3] >= height - 2
+        if bool(getattr(component, "edge_touch", False)) or near_edge:
+            count += 1
+    return count
+
+
+def _compact_area_rebalance(root_components: list[Any], current_components: list[Any]) -> float:
+    root_area = sum(int(getattr(component, "area", 0) or 0) for component in root_components)
+    current_area = sum(
+        int(getattr(component, "area", 0) or 0) for component in current_components
+    )
+    return abs(current_area - root_area) / max(1, root_area + current_area)
 
 
 def _game_key(game: Any, frame_hash: str) -> str:
