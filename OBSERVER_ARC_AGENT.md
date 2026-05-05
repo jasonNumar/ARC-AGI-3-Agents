@@ -14,6 +14,8 @@
 - For visually silent keyboard/action environments, the planner has a bounded hidden-sequence probe that keeps no-change prefixes long enough to discover short ordered sequences, while still validating queued rollouts against rendered frame preconditions.
 - When no goal-distance heuristic is known, the planner can promote a nonterminal action that reveals substantial new state information while rejecting simulated game-over transitions.
 - The planner can also search short observable state-delta sequences and queue the next action only when later rendered frames reveal substantially more than the first action alone.
+- The planner now includes a bounded frontier objective for long-horizon subgoal selection: simulated nonterminal paths are ranked by reachable frame novelty, visible component/relation change, affordance expansion, salience change, option preservation, distance from already visited/frontier states, and whether the frontier exposes future objective progress. This is still game-agnostic and does not use labels, public traces, or hidden goal-distance functions.
+- Repeated one-step information-probe selections now create frontier pressure: before accepting another local reveal action, the planner temporarily promotes bounded frontier/objective search when it has revisited the same rendered state or stayed in an information-probe streak. This keeps local novelty from monopolizing action selection.
 - Queued simulator rollouts carry visible-frame preconditions; if the actual rendered state diverges from the predicted sequence, the queue is discarded and replanned.
 - The frame-only fallback has generalized action-effect, action-information, boundary, transition-motif, goal-discovery, failed-policy, episode-local viability, latent-role, delayed sequence-credit, learned sequence-fragment, trajectory, and object-role memory: it abstracts transitions across different frame hashes, learns which actions reveal new observable state, recognizes screen-edge and rendered-object boundaries, stores exact and abstract state-delta motifs, estimates candidate subgoals from progress/information/affordance changes, remembers no-progress or game-over branches as "obvious but failed" alternatives, estimates whether actions preserve future options inside the current episode, infers functional roles such as key, target, trigger, resource, protector, obstacle, trap, hazard, or threat from how actions change future possibilities, assigns decayed credit to earlier moves in successful or failed sequences, learns reusable next-action fragments, infers action-to-motion tendencies from state sequences, treats boundaries as likely constraints, and learns whether motion appears to pursue or avoid another object.
 - A bounded action/subgoal comparator then reranks candidates with explicit progress, information gain, goal affinity, transition consistency, repeat risk, and action-budget signals. This makes the state-sequence philosophy operational without adding game-specific labels or public replay data.
@@ -40,7 +42,7 @@ FrameData
   -> MemoryState: exact transitions, generalized action effects, action-information priors, boundary recognition, transition motifs, goal candidates, failed-policy traces, episode-local viability and empowerment estimates, latent transition roles, delayed sequence credit, learned sequence fragments, trajectory constraints, object roles, and semantic frame associations
   -> OtherState: common weak baselines, recent loops, and failed no-progress/game-over policies to avoid
   -> SelfState: current plan, uncertainty, hypotheses, suppressed actions
-  -> optional local simulator planner with salience-ranked click search, synthesized frame-available click probes, one-step click scanning, low-branch sequence probing, hidden no-change sequence probing, information-gain probing, short information-sequence probing, and visible precondition validation
+  -> optional local simulator planner with salience-ranked click search, synthesized frame-available click probes, one-step click scanning, low-branch sequence probing, hidden no-change sequence probing, information-gain probing, short information-sequence probing, frontier-pressure gating, long-horizon frontier subgoal selection, objective-proximity probing, and visible precondition validation
   -> comparator-guided action/subgoal reranking fallback with explicit progress/information/goal/consistency/repeat/budget signals and audit trace
   -> GameAction
 ```
@@ -76,9 +78,14 @@ The local simulator planner uses fixed caps from `observer_arc/model_config.json
 (`planner_depth`, `planner_beam_width`, `planner_branch_limit`,
 `planner_max_nodes`, and `planner_max_seconds`). Partial nonterminal rollouts
 are promoted only for low-branch action spaces. Otherwise the planner takes
-over only when it finds actual level progress, a short ordered plan, or a
-simulated nonterminal action that reveals enough new state information to
-justify further exploration.
+over only when it finds actual level progress, a short ordered plan, a
+simulated nonterminal action that reveals enough new state information, a
+bounded multi-step frontier path that expands visible state/affordances, or a
+frontier state that exposes a near-future level gain without relying on
+game-specific objective labels. If repeated local information probes are
+blocking those long-horizon checks, frontier pressure runs the frontier pass
+before the next one-step information probe and raises the acceptance threshold
+for familiar information-only transitions.
 
 ## Run
 

@@ -1166,6 +1166,165 @@ def test_local_simulator_information_sequence_finds_revealing_prefix():
     assert [candidate.action_id for candidate in planner.queued_plan] == [3]
 
 
+class FrontierAffordanceGame:
+    def __init__(self):
+        self._score = 0
+        self._state = GameState.NOT_FINISHED
+        self._current_level_index = 0
+        self.primed = False
+        self.revealed = False
+
+    def _get_valid_actions(self):
+        actions = [
+            ActionInput(id=GameAction.ACTION1),
+            ActionInput(id=GameAction.ACTION2),
+            ActionInput(id=GameAction.ACTION3),
+        ]
+        if self.primed:
+            actions.append(ActionInput(id=GameAction.ACTION4))
+        return actions
+
+    def perform_action(self, action_input, raw=False):
+        if action_input.id == GameAction.ACTION2:
+            self.primed = True
+        elif action_input.id == GameAction.ACTION4 and self.primed:
+            self.revealed = True
+        frame = FrameDataRaw()
+        frame.state = self._state
+        frame.levels_completed = self._score
+        frame.win_levels = 1
+        arr = np.zeros((24, 24), dtype=np.int8)
+        arr[0, 0] = 2
+        if self.revealed:
+            arr[14:18, 14:18] = 7
+        frame.frame = [arr]
+        frame.available_actions = [1, 2, 3, 4] if self.primed else [1, 2, 3]
+        return frame
+
+
+def test_local_simulator_frontier_selects_long_horizon_subgoal():
+    game = FrontierAffordanceGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    game.primed = False
+    game.revealed = False
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=6, beam_width=4, branch_limit=4, max_nodes=1024, max_seconds=1.0)
+    )
+
+    action = planner.plan(game, latest)
+
+    assert action is not None
+    assert action.action_id == 2
+    assert "frontier selected subgoal" in action.explanation
+    assert [candidate.action_id for candidate in planner.queued_plan] == [4]
+
+
+class ObjectiveProximityGame:
+    def __init__(self):
+        self._score = 0
+        self._state = GameState.NOT_FINISHED
+        self._current_level_index = 0
+        self.primed = False
+
+    def _get_valid_actions(self):
+        actions = [
+            ActionInput(id=GameAction.ACTION1),
+            ActionInput(id=GameAction.ACTION2),
+            ActionInput(id=GameAction.ACTION3),
+        ]
+        if self.primed:
+            actions.append(ActionInput(id=GameAction.ACTION4))
+        return actions
+
+    def perform_action(self, action_input, raw=False):
+        if action_input.id == GameAction.ACTION2:
+            self.primed = True
+        elif action_input.id == GameAction.ACTION4 and self.primed:
+            self._score = 1
+            self._state = GameState.WIN
+        frame = FrameDataRaw()
+        frame.state = self._state
+        frame.levels_completed = self._score
+        frame.win_levels = 1
+        frame.frame = [np.zeros((8, 8), dtype=np.int8)]
+        frame.available_actions = [1, 2, 3, 4] if self.primed else [1, 2, 3]
+        return frame
+
+
+def test_local_simulator_objective_proximity_extends_shallow_frontier():
+    game = ObjectiveProximityGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    game.primed = False
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=1, beam_width=4, branch_limit=4, max_nodes=256, max_seconds=1.0)
+    )
+
+    action = planner.plan(game, latest)
+
+    assert action is not None
+    assert action.action_id == 2
+    assert "objective proximity" in action.explanation
+    assert [candidate.action_id for candidate in planner.queued_plan] == [4]
+
+
+class FrontierPressureGame:
+    def __init__(self):
+        self._score = 0
+        self._state = GameState.NOT_FINISHED
+        self._current_level_index = 0
+        self.primed = False
+        self.revealed = False
+
+    def _get_valid_actions(self):
+        actions = [
+            ActionInput(id=GameAction.ACTION1),
+            ActionInput(id=GameAction.ACTION2),
+            ActionInput(id=GameAction.ACTION3),
+        ]
+        if self.primed:
+            actions.append(ActionInput(id=GameAction.ACTION4))
+        return actions
+
+    def perform_action(self, action_input, raw=False):
+        if action_input.id == GameAction.ACTION2:
+            self.primed = True
+        elif action_input.id == GameAction.ACTION3:
+            self.revealed = True
+        elif action_input.id == GameAction.ACTION4 and self.primed:
+            self._score = 1
+            self._state = GameState.WIN
+        frame = FrameDataRaw()
+        frame.state = self._state
+        frame.levels_completed = self._score
+        frame.win_levels = 1
+        arr = np.zeros((12, 12), dtype=np.int8)
+        if self.revealed:
+            arr[2:10, 2:10] = 6
+        frame.frame = [arr]
+        frame.available_actions = [1, 2, 3, 4] if self.primed else [1, 2, 3]
+        return frame
+
+
+def test_frontier_pressure_preempts_repeated_information_probe_bias():
+    game = FrontierPressureGame()
+    latest = game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+    game.primed = False
+    game.revealed = False
+    planner = LocalSimulatorPlanner(
+        PlannerConfig(max_depth=1, beam_width=4, branch_limit=4, max_nodes=256, max_seconds=1.0)
+    )
+    planner.information_probe_streak = 5
+
+    action = planner.plan(game, latest)
+
+    assert action is not None
+    assert action.action_id == 2
+    assert action.source == "local-simulator-objective-proximity"
+    assert "frontier_pressure" in action.explanation
+    assert [candidate.action_id for candidate in planner.queued_plan] == [4]
+    assert planner.information_probe_streak == 0
+
+
 class InvisibleOrderedSequenceGame:
     def __init__(self):
         self._score = 0
